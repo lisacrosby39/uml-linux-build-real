@@ -32,7 +32,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
             libncurses-dev dwarves wget xz-utils ca-certificates jq \
-            debootstrap e2fsprogs util-linux
+            debootstrap e2fsprogs util-linux iproute2 iptables iputils-ping curl
 
       - name: Resolve kernel version
         id: version
@@ -73,6 +73,16 @@ jobs:
           ./scripts/config --enable CONFIG_EXT4_FS || true
           ./scripts/config --enable CONFIG_HOSTFS || true
           ./scripts/config --enable CONFIG_MAGIC_SYSRQ || true
+          # Networking (try common transports for UML)
+          ./scripts/config --enable CONFIG_UML_NET || true
+          ./scripts/config --enable CONFIG_UML_NET_VECTOR || true
+          ./scripts/config --enable CONFIG_UML_NET_TUNTAP || true
+          ./scripts/config --enable CONFIG_UML_NET_SLIRP || true
+          ./scripts/config --enable CONFIG_UML_NET_DETERMINISTIC_MAC || true
+          ./scripts/config --enable CONFIG_INET || true
+          ./scripts/config --enable CONFIG_PACKET || true
+          ./scripts/config --enable CONFIG_UNIX || true
+          ./scripts/config --enable CONFIG_NETDEVICES || true
           make ARCH=um olddefconfig
 
       - name: Build UML kernel
@@ -104,6 +114,15 @@ jobs:
           sysfs /sys sysfs defaults 0 0
           FSTAB
           sudo mkdir -p "$MNT/proc" "$MNT/sys" "$MNT/dev"
+          # Install basic networking tools inside the guest
+          sudo cp /etc/resolv.conf "$MNT/etc/resolv.conf" || true
+          sudo mount --bind /dev "$MNT/dev"
+          sudo mount --bind /dev/pts "$MNT/dev/pts"
+          sudo mount -t proc proc "$MNT/proc"
+          sudo mount -t sysfs sys "$MNT/sys"
+          sudo chroot "$MNT" /bin/sh -c 'apt-get update && apt-get install -y --no-install-recommends iproute2 iputils-ping ca-certificates wget curl && rm -rf /var/lib/apt/lists/*'
+          sudo umount "$MNT/sys" "$MNT/proc" "$MNT/dev/pts" "$MNT/dev"
+          echo 'nameserver 8.8.8.8' | sudo tee "$MNT/etc/resolv.conf" >/dev/null
           # Init script executed by UML (avoids relying on stdin/tty behavior)
           sudo tee "$MNT/init.uml" >/dev/null <<'SCRIPT'
           #!/bin/sh
@@ -112,11 +131,39 @@ jobs:
           echo '--- UML_BOOT_BEGIN ---'
           echo "KERNEL=$(uname -r)"
           echo "ARCH=$(uname -m)"
+          echo "MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo unknown)"
           if [ -f /etc/os-release ]; then
             echo '--- OS_RELEASE ---'
             cat /etc/os-release
           fi
-          echo helo
+
+          # Networking setup (TAP on host expected at 192.168.254.1/24)
+          IFACE=""
+          for c in eth0 vec0 eth1; do
+            if ip link show "$c" >/dev/null 2>&1; then IFACE="$c"; break; fi
+          done
+          echo "NET_IFACE=${IFACE:-none}"
+          if [ -n "$IFACE" ]; then
+            ip link set "$IFACE" up || true
+            ip addr add 192.168.254.2/24 dev "$IFACE" 2>/dev/null || true
+            ip route add default via 192.168.254.1 2>/dev/null || true
+            echo 'nameserver 8.8.8.8' > /etc/resolv.conf || true
+            sleep 1
+            echo '--- NET_TEST ---'
+            ip -o addr show dev "$IFACE" || true
+            ip route || true
+            ping -c 1 -W 3 192.168.254.1 >/dev/null 2>&1 && echo "PING_GW_OK" || echo "PING_GW_FAIL"
+            ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1 && echo "PING_INET_OK" || echo "PING_INET_FAIL"
+            if wget -q --timeout=10 -O /dev/null https://example.com 2>/dev/null || curl -fsS --max-time 10 -o /dev/null https://example.com 2>/dev/null; then
+              echo "NET_FETCH_OK"
+            else
+              echo "NET_FETCH_FAIL"
+            fi
+          else
+            echo "NET_NO_IFACE"
+            ip link || true
+          fi
+
           echo '--- MARKER: UBUNTU_ROOTFS_OK ---'
           sync
           poweroff -f 2>/dev/null || halt -f 2>/dev/null || echo o > /proc/sysrq-trigger 2>/dev/null || true
@@ -140,23 +187,42 @@ jobs:
           chmod +x "$KERNEL"
           LOG="uml-boot.log"
 
+          # Host networking for UML guest (TAP + NAT)
+          sudo ip tuntap add tap0 mode tap user "$(id -un)" || sudo ip tuntap add tap0 mode tap || true
+          sudo ip addr add 192.168.254.1/24 dev tap0 || true
+          sudo ip link set tap0 up
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo iptables -t nat -A POSTROUTING -s 192.168.254.0/24 -o "$(ip route show default | awk '/default/ {print $5; exit}')" -j MASQUERADE || true
+          sudo iptables -A FORWARD -i tap0 -j ACCEPT || true
+          sudo iptables -A FORWARD -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT || true
+
           set +e
           timeout --signal=KILL 300 "$KERNEL" \
             ubda="$IMG" \
             root=/dev/ubda \
             rw \
-            mem=512M \
+            mem=3072M \
             init=/init.uml \
+            eth0=tuntap,tap0 \
+            vec0:transport=tap,ifname=tap0 \
             con0=null,fd:1 con=null \
             > "$LOG" 2>&1
           RC=$?
           set -e
           echo "UML exit code: $RC"
           echo "---- boot log tail ----"
-          tail -n 120 "$LOG" || true
+          tail -n 160 "$LOG" || true
           echo "-----------------------"
           grep -q 'UBUNTU_ROOTFS_OK' "$LOG" || { echo "ERROR: Ubuntu rootfs did not boot/run as expected"; exit 1; }
           grep -q 'ID=ubuntu' "$LOG" || echo "WARNING: /etc/os-release did not show ID=ubuntu (check log)"
+          if grep -q 'NET_FETCH_OK' "$LOG"; then
+            echo "Networking test: OK"
+          else
+            echo "WARNING: Networking fetch test did not succeed; see log for details"
+          fi
+          if grep -q 'PING_INET_OK' "$LOG"; then
+            echo "Internet ping: OK"
+          fi
 
       - name: Collect artifacts
         if: always()
