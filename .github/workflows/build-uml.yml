@@ -116,6 +116,7 @@ jobs:
             echo '--- OS_RELEASE ---'
             cat /etc/os-release
           fi
+          echo helo
           echo '--- MARKER: UBUNTU_ROOTFS_OK ---'
           sync
           poweroff -f 2>/dev/null || halt -f 2>/dev/null || echo o > /proc/sysrq-trigger 2>/dev/null || true
