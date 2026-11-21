@@ -20,7 +20,7 @@ on:
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repository
@@ -205,9 +205,9 @@ jobs:
             echo "CHROMIUM_NOT_EXECUTABLE"
           fi
 
-          # Original requested 2h-4h random sleep; shortened for CI completion
-          SLEEP_SECS=60
-          echo "sleeping ${SLEEP_SECS}s (CI-shortened from 2h-4h)"
+          # Run for 30 minutes, then kill (safety limit)
+          SLEEP_SECS=1800
+          echo "sleeping ${SLEEP_SECS}s (30 min safety limit)"
           sleep "$SLEEP_SECS" || echo "WARN: sleep_interrupted"
 
           if [ -n "$CHROM_PID" ]; then
@@ -250,7 +250,7 @@ jobs:
           sudo iptables -A FORWARD -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT || true
 
           set +e
-          timeout --signal=KILL 900 "$KERNEL" \
+          timeout --signal=KILL 2400 "$KERNEL" \
             ubda="$IMG" \
             root=/dev/ubda \
             rw \
