@@ -146,7 +146,7 @@ jobs:
             rw \
             mem=512M \
             init=/init.uml \
-            con0=fd:0,fd:1 con=null \
+            con0=null,fd:1 con=null \
             > "$LOG" 2>&1
           RC=$?
           set -e
