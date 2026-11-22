@@ -93,7 +93,7 @@ jobs:
           truncate -s 1G "$IMG"
           mkfs.ext4 -F "$IMG"
           sudo mount -o loop "$IMG" "$MNT"
-          cleanup() { sudo umount "$MNT" || true; rmdir "$MNT" || true; }
+          cleanup() { sudo umount "$MNT" 2>/dev/null || true; rmdir "$MNT" 2>/dev/null || true; }
           trap cleanup EXIT
           sudo debootstrap --variant=minbase "$SUITE" "$MNT" http://archive.ubuntu.com/ubuntu
           # Basic config
@@ -104,6 +104,24 @@ jobs:
           sysfs /sys sysfs defaults 0 0
           FSTAB
           sudo mkdir -p "$MNT/proc" "$MNT/sys" "$MNT/dev"
+          # Init script executed by UML (avoids relying on stdin/tty behavior)
+          sudo tee "$MNT/init.uml" >/dev/null <<'SCRIPT'
+          #!/bin/sh
+          mount -t proc proc /proc 2>/dev/null || true
+          mount -t sysfs sysfs /sys 2>/dev/null || true
+          echo '--- UML_BOOT_BEGIN ---'
+          echo "KERNEL=$(uname -r)"
+          echo "ARCH=$(uname -m)"
+          if [ -f /etc/os-release ]; then
+            echo '--- OS_RELEASE ---'
+            cat /etc/os-release
+          fi
+          echo '--- MARKER: UBUNTU_ROOTFS_OK ---'
+          sync
+          poweroff -f 2>/dev/null || halt -f 2>/dev/null || echo o > /proc/sysrq-trigger 2>/dev/null || true
+          sleep 5
+          SCRIPT
+          sudo chmod +x "$MNT/init.uml"
           sync
           sudo umount "$MNT"
           trap - EXIT
@@ -120,21 +138,6 @@ jobs:
           KERNEL="linux-${KVER}/linux"
           chmod +x "$KERNEL"
           LOG="uml-boot.log"
-          CMDS="$(mktemp)"
-          cat > "$CMDS" <<'SCRIPT'
-          mount -t proc proc /proc || true
-          mount -t sysfs sys /sys || true
-          echo '--- UML_BOOT_BEGIN ---'
-          echo "KERNEL=$(uname -r)"
-          echo "ARCH=$(uname -m)"
-          if [ -f /etc/os-release ]; then
-            echo '--- OS_RELEASE ---'
-            cat /etc/os-release
-          fi
-          echo '--- MARKER: UBUNTU_ROOTFS_OK ---'
-          sync
-          poweroff -f 2>/dev/null || halt -f 2>/dev/null || reboot -f 2>/dev/null || echo o > /proc/sysrq-trigger 2>/dev/null || true
-          SCRIPT
 
           set +e
           timeout --signal=KILL 300 "$KERNEL" \
@@ -142,9 +145,9 @@ jobs:
             root=/dev/ubda \
             rw \
             mem=512M \
-            init=/bin/sh \
-            con=null con0=null,fd:2 con1=fd:0,fd:1 \
-            < "$CMDS" > "$LOG" 2>&1
+            init=/init.uml \
+            con0=fd:0,fd:1 con=null \
+            > "$LOG" 2>&1
           RC=$?
           set -e
           echo "UML exit code: $RC"
