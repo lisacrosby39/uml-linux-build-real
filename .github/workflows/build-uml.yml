@@ -1,4 +1,4 @@
-name: Build UML Linux kernel
+name: Build and run UML Linux with Ubuntu rootfs
 
 on:
   workflow_dispatch:
@@ -7,6 +7,10 @@ on:
         description: "Kernel version to build (e.g. 6.12.1). Leave empty for latest stable."
         required: false
         default: ""
+      ubuntu_suite:
+        description: "Ubuntu suite for rootfs image (e.g. noble, jammy)"
+        required: false
+        default: "noble"
   push:
     branches: [ main, master ]
     paths:
@@ -14,20 +18,21 @@ on:
       - 'scripts/**'
 
 jobs:
-  build:
+  build-and-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev \
-            libncurses-dev dwarves wget xz-utils ca-certificates jq
+            libncurses-dev dwarves wget xz-utils ca-certificates jq \
+            debootstrap e2fsprogs util-linux
 
       - name: Resolve kernel version
         id: version
@@ -50,7 +55,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "url=${BASE_URL}/${TARBALL}" >> "$GITHUB_OUTPUT"
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
-          echo "Building Linux $VERSION from ${BASE_URL}/${TARBALL}"
+          echo "Building Linux $VERSION"
 
       - name: Download and extract kernel source
         run: |
@@ -63,7 +68,9 @@ jobs:
         run: |
           set -euo pipefail
           make ARCH=um defconfig
-          # Ensure useful options for UML
+          # Useful/required options for running from a block device image
+          ./scripts/config --enable CONFIG_BLK_DEV_UBD || true
+          ./scripts/config --enable CONFIG_EXT4_FS || true
           ./scripts/config --enable CONFIG_HOSTFS || true
           ./scripts/config --enable CONFIG_MAGIC_SYSRQ || true
           make ARCH=um olddefconfig
@@ -74,26 +81,104 @@ jobs:
           set -euo pipefail
           make ARCH=um -j"$(nproc)"
 
-      - name: Collect artifacts
+      - name: Create Ubuntu rootfs image
+        id: rootfs
+        env:
+          SUITE: ${{ github.event.inputs.ubuntu_suite || 'noble' }}
         run: |
           set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p out
-          if [ -f "linux-${VERSION}/linux" ]; then
-            cp "linux-${VERSION}/linux" "out/linux-${VERSION}-um"
-            chmod +x "out/linux-${VERSION}-um"
-          fi
-          if [ -f "linux-${VERSION}/vmlinux" ]; then
-            cp "linux-${VERSION}/vmlinux" "out/vmlinux-${VERSION}-um"
-          fi
-          cp "linux-${VERSION}/.config" "out/config-${VERSION}-um"
-          echo "$VERSION" > "out/kernel-version.txt"
-          ls -lh out
+          IMG="ubuntu-${SUITE}-uml.img"
+          MNT="$(mktemp -d)"
+          echo "Creating $IMG (1G sparse ext4) with Ubuntu $SUITE..."
+          truncate -s 1G "$IMG"
+          mkfs.ext4 -F "$IMG"
+          sudo mount -o loop "$IMG" "$MNT"
+          cleanup() { sudo umount "$MNT" || true; rmdir "$MNT" || true; }
+          trap cleanup EXIT
+          sudo debootstrap --variant=minbase "$SUITE" "$MNT" http://archive.ubuntu.com/ubuntu
+          # Basic config
+          echo "ubuntu-uml" | sudo tee "$MNT/etc/hostname" >/dev/null
+          sudo tee "$MNT/etc/fstab" >/dev/null <<'FSTAB'
+          /dev/ubda / ext4 defaults 0 1
+          proc /proc proc defaults 0 0
+          sysfs /sys sysfs defaults 0 0
+          FSTAB
+          sudo mkdir -p "$MNT/proc" "$MNT/sys" "$MNT/dev"
+          sync
+          sudo umount "$MNT"
+          trap - EXIT
+          rmdir "$MNT"
+          echo "img=$IMG" >> "$GITHUB_OUTPUT"
+          ls -lh "$IMG"
 
-      - name: Upload kernel artifact
+      - name: Run Ubuntu rootfs in UML
+        env:
+          KVER: ${{ steps.version.outputs.version }}
+          IMG: ${{ steps.rootfs.outputs.img }}
+        run: |
+          set -euo pipefail
+          KERNEL="linux-${KVER}/linux"
+          chmod +x "$KERNEL"
+          LOG="uml-boot.log"
+          CMDS="$(mktemp)"
+          cat > "$CMDS" <<'SCRIPT'
+          mount -t proc proc /proc || true
+          mount -t sysfs sys /sys || true
+          echo '--- UML_BOOT_BEGIN ---'
+          echo "KERNEL=$(uname -r)"
+          echo "ARCH=$(uname -m)"
+          if [ -f /etc/os-release ]; then
+            echo '--- OS_RELEASE ---'
+            cat /etc/os-release
+          fi
+          echo '--- MARKER: UBUNTU_ROOTFS_OK ---'
+          sync
+          poweroff -f 2>/dev/null || halt -f 2>/dev/null || reboot -f 2>/dev/null || echo o > /proc/sysrq-trigger 2>/dev/null || true
+          SCRIPT
+
+          set +e
+          timeout --signal=KILL 300 "$KERNEL" \
+            ubda="$IMG" \
+            root=/dev/ubda \
+            rw \
+            mem=512M \
+            init=/bin/sh \
+            con=null con0=null,fd:2 con1=fd:0,fd:1 \
+            < "$CMDS" > "$LOG" 2>&1
+          RC=$?
+          set -e
+          echo "UML exit code: $RC"
+          echo "---- boot log tail ----"
+          tail -n 120 "$LOG" || true
+          echo "-----------------------"
+          grep -q 'UBUNTU_ROOTFS_OK' "$LOG" || { echo "ERROR: Ubuntu rootfs did not boot/run as expected"; exit 1; }
+          grep -q 'ID=ubuntu' "$LOG" || echo "WARNING: /etc/os-release did not show ID=ubuntu (check log)"
+
+      - name: Collect artifacts
+        if: always()
+        env:
+          KVER: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          if [ -f "linux-${KVER}/linux" ]; then
+            cp "linux-${KVER}/linux" "out/linux-${KVER}-um"
+            chmod +x "out/linux-${KVER}-um"
+          fi
+          cp "linux-${KVER}/.config" "out/config-${KVER}-um" 2>/dev/null || true
+          echo "$KVER" > "out/kernel-version.txt"
+          cp uml-boot.log out/ 2>/dev/null || true
+          # Compress rootfs image if present (can be large)
+          if [ -f "${{ steps.rootfs.outputs.img || '' }}" ]; then
+            gzip -c "${{ steps.rootfs.outputs.img }}" > "out/${{ steps.rootfs.outputs.img }}.gz" || true
+          fi
+          ls -lh out || true
+
+      - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: uml-linux-${{ steps.version.outputs.version }}
+          name: uml-ubuntu-${{ steps.version.outputs.version }}
           path: out/
-          if-no-files-found: error
-          retention-days: 30
+          if-no-files-found: warn
+          retention-days: 14
